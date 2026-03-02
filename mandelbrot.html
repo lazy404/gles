@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mandelbrot Set — WebGL</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+    canvas { display: block; width: 100%; height: 100%; }
+
+    #overlay {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      font-family: 'Courier New', monospace;
+      color: rgba(255, 255, 255, 0.9);
+      text-shadow: 0 1px 6px rgba(0,0,0,0.9), 0 0 2px rgba(0,0,0,1);
+    }
+    #title {
+      position: absolute;
+      top: 22px;
+      width: 100%;
+      text-align: center;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .5em;
+      text-transform: uppercase;
+      color: rgba(255, 255, 255, 0.55);
+    }
+    #hud {
+      position: absolute;
+      bottom: 20px;
+      left: 20px;
+      font-size: 12px;
+      line-height: 2;
+      letter-spacing: .06em;
+    }
+    #controls {
+      position: absolute;
+      bottom: 20px;
+      right: 20px;
+      font-size: 11px;
+      line-height: 2.2;
+      letter-spacing: .06em;
+      text-align: right;
+      color: rgba(255, 255, 255, 0.6);
+    }
+    #controls kbd {
+      display: inline-block;
+      padding: 0 5px;
+      border: 1px solid rgba(255,255,255,0.45);
+      border-radius: 3px;
+      font-family: inherit;
+      font-size: 10px;
+      color: rgba(255,255,255,0.75);
+    }
+    canvas { cursor: crosshair; }
+
+    /* Small ring that flashes at the click point */
+    #click-marker {
+      position: fixed;
+      width: 14px;
+      height: 14px;
+      border: 1.5px solid rgba(255, 255, 255, 0.75);
+      border-radius: 50%;
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.6s ease-out, transform 0.6s ease-out;
+    }
+    #click-marker.pop {
+      opacity: 1;
+      transition: none;
+      transform: translate(-50%, -50%) scale(1);
+    }
+
+    /* Reticle: subtle crosshair pinned to screen centre */
+    #reticle {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      width: 18px;
+      height: 18px;
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+    }
+    #reticle::before, #reticle::after {
+      content: '';
+      position: absolute;
+      background: rgba(255, 255, 255, 0.28);
+    }
+    #reticle::before { /* horizontal bar */
+      top: 50%; left: 0; right: 0; height: 1px;
+      transform: translateY(-50%);
+    }
+    #reticle::after {  /* vertical bar */
+      left: 50%; top: 0; bottom: 0; width: 1px;
+      transform: translateX(-50%);
+    }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="overlay">
+  <div id="title">Mandelbrot Set</div>
+  <div id="hud"></div>
+  <div id="controls">
+    <kbd>click</kbd> &nbsp;set target<br>
+    <kbd>↑</kbd> / <kbd>↓</kbd> &nbsp;speed<br>
+    <kbd>Space</kbd> &nbsp;reverse<br>
+    <kbd>R</kbd> &nbsp;reset
+  </div>
+  <div id="reticle"></div>
+  <div id="click-marker"></div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  const canvas  = document.getElementById('c');
+  const hud     = document.getElementById('hud');
+  const marker  = document.getElementById('click-marker');
+
+  const gl = canvas.getContext('webgl', {
+    alpha: false,
+    antialias: false,
+    preserveDrawingBuffer: false,
+  });
+
+  if (!gl) {
+    document.body.style.cssText =
+      'display:flex;align-items:center;justify-content:center;' +
+      'height:100vh;color:#fff;font-family:monospace;font-size:16px';
+    document.body.textContent = 'WebGL is not supported in this browser.';
+    return;
+  }
+
+  /* ─────────────────────────────── Shaders ─────────────────────────────── */
+
+  const VERT_SRC = `
+    attribute vec2 a_pos;
+    void main() {
+      gl_Position = vec4(a_pos, 0.0, 1.0);
+    }
+  `;
+
+  /* All Mandelbrot math lives in the fragment shader, running per-pixel
+     on the GPU via OpenGL ES 2.0 (WebGL).                                   */
+  const FRAG_SRC = `
+    precision highp float;
+
+    uniform vec2  u_res;      /* viewport size in pixels                    */
+    uniform float u_zoom;     /* current zoom level                         */
+    uniform vec2  u_center;   /* complex-plane centre                       */
+    uniform float u_time;     /* elapsed seconds (drives colour animation)  */
+
+    /* Inigo Quilez cosine palette — produces smooth, vivid colour bands.    */
+    vec3 palette(float t) {
+      vec3 a = vec3(0.5, 0.5, 0.5);
+      vec3 b = vec3(0.5, 0.5, 0.5);
+      vec3 c = vec3(1.0, 1.0, 1.0);
+      vec3 d = vec3(0.00, 0.10, 0.20);   /* phase offsets → blue-gold hues  */
+      return a + b * cos(6.28318 * (c * t + d));
+    }
+
+    void main() {
+      /* Map pixel coordinate to complex number c.
+         At u_zoom = 1 the shorter screen dimension spans ±1.25 units,
+         so the full Mandelbrot set is visible on the initial frame.         */
+      vec2 uv = (gl_FragCoord.xy - u_res * 0.5) / min(u_res.x, u_res.y) * 2.5;
+      vec2 c  = u_center + uv / u_zoom;
+
+      /* ── Mandelbrot iteration  z_{n+1} = z_n² + c,  z_0 = 0 ──────────── */
+      vec2  z = vec2(0.0);
+      float n = 0.0;
+
+      for (int i = 0; i < 256; i++) {
+        if (dot(z, z) > 4.0) break;
+        z  = vec2(z.x * z.x - z.y * z.y + c.x,
+                  2.0 * z.x * z.y          + c.y);
+        n += 1.0;
+      }
+
+      /* ── Interior (in the set) → black ─────────────────────────────────── */
+      if (n >= 256.0) {
+        gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+      }
+
+      /* ── Smooth / continuous iteration count (eliminates banding) ────────
+         Formula:  smooth = n + 1 - log₂( log₂( |z| ) )
+         Requires |z| > 2 after escape, which is guaranteed by our test.     */
+      float log_z  = log(dot(z, z)) * 0.5;             /* ln(|z|)            */
+      float nu     = log(log_z / log(2.0)) / log(2.0); /* log₂(log₂|z|)      */
+      float smooth = n + 1.0 - nu;
+
+      /* ── Colour: palette index cycles slowly with zoom & time ──────────── */
+      float t = fract(smooth * 0.013 + u_time * 0.04);
+      vec3  col = palette(t);
+
+      /* Subtle brightness boost near the set boundary for depth perception   */
+      col *= 0.65 + 0.35 * smoothstep(0.0, 14.0, n);
+
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `;
+
+  /* ───────────────────────── Compile & link ────────────────────────────── */
+
+  function mkShader(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+      throw new Error('Shader error: ' + gl.getShaderInfoLog(s));
+    return s;
+  }
+
+  const prog = gl.createProgram();
+  gl.attachShader(prog, mkShader(gl.VERTEX_SHADER,   VERT_SRC));
+  gl.attachShader(prog, mkShader(gl.FRAGMENT_SHADER, FRAG_SRC));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+    throw new Error('Link error: ' + gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+
+  /* ──────────────────────── Fullscreen quad ────────────────────────────── */
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(
+    gl.ARRAY_BUFFER,
+    new Float32Array([-1, -1,  1, -1,  -1, 1,  1, 1]),
+    gl.STATIC_DRAW
+  );
+
+  const aPos = gl.getAttribLocation(prog, 'a_pos');
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+  const uRes    = gl.getUniformLocation(prog, 'u_res');
+  const uZoom   = gl.getUniformLocation(prog, 'u_zoom');
+  const uCenter = gl.getUniformLocation(prog, 'u_center');
+  const uTime   = gl.getUniformLocation(prog, 'u_time');
+
+  /* ─────────────────────── Animation parameters ────────────────────────── */
+
+  /* Zoom target — mutable so the user can click to pick a new one.
+     Default: "Seahorse Valley", a region rich with spiralling filaments.     */
+  const INIT_CX = -0.7746806106269039;
+  const INIT_CY =  0.1341201356098;
+  let cx = INIT_CX;
+  let cy = INIT_CY;
+
+  /* Zoom rate in natural-log units per millisecond.
+     Positive = zoom in, negative = zoom out.
+     At BASE_RATE the zoom doubles roughly every 4.3 seconds.                */
+  const BASE_RATE  = 0.00016;
+  const RATE_MIN   = BASE_RATE / 8;   /* slowest allowed absolute speed      */
+  const RATE_MAX   = BASE_RATE * 8;   /* fastest allowed absolute speed      */
+  const ZOOM_MIN   = 1.0;
+  const ZOOM_MAX   = 6e5;             /* float32 precision limit             */
+
+  let zoomRate = BASE_RATE;   /* signed; flip sign to reverse direction      */
+  let zoom     = 1.0;
+  let prevTs   = null;
+
+  /* ───────────────────────── Input handling ────────────────────────────── */
+
+  function faster() {
+    const sign = zoomRate >= 0 ? 1 : -1;
+    zoomRate = sign * Math.min(Math.abs(zoomRate) * 1.6, RATE_MAX);
+  }
+  function slower() {
+    const sign = zoomRate >= 0 ? 1 : -1;
+    zoomRate = sign * Math.max(Math.abs(zoomRate) / 1.6, RATE_MIN);
+  }
+  function reverse() { zoomRate = -zoomRate; }
+  function reset()   { zoomRate = BASE_RATE; zoom = ZOOM_MIN; cx = INIT_CX; cy = INIT_CY; }
+
+  /* ─────────────── Mouse: pick a new zoom target by clicking ──────────── */
+
+  /* Invert the fragment shader mapping:
+       uv  = (gl_FragCoord.xy - res/2) / min(res) * 2.5
+       c   = center + uv / zoom
+     Mouse Y is flipped relative to WebGL (mouse: top=0, GL: bottom=0).      */
+  function mouseToComplex(e) {
+    const minRes = Math.min(canvas.width, canvas.height);
+    const uvx = (e.clientX - canvas.width  * 0.5) / minRes * 2.5;
+    const uvy = (canvas.height * 0.5 - e.clientY) / minRes * 2.5;  /* flip Y */
+    return [ cx + uvx / zoom, cy + uvy / zoom ];
+  }
+
+  /* Show the complex coordinate under the cursor in the HUD while hovering  */
+  let hoverC = null;
+  canvas.addEventListener('mousemove', function (e) { hoverC = mouseToComplex(e); });
+  canvas.addEventListener('mouseleave', function ()  { hoverC = null; });
+
+  canvas.addEventListener('click', function (e) {
+    const [nx, ny] = mouseToComplex(e);
+    cx = nx;
+    cy = ny;
+
+    /* Brief visual ring at the click point */
+    marker.style.left = e.clientX + 'px';
+    marker.style.top  = e.clientY + 'px';
+    marker.classList.remove('pop');
+    void marker.offsetWidth;                   /* force reflow to restart anim  */
+    marker.classList.add('pop');
+    setTimeout(function () { marker.classList.remove('pop'); }, 50);
+  });
+
+  document.addEventListener('keydown', function (e) {
+    switch (e.key) {
+      case 'ArrowUp':   case '+': case '=': faster();  break;
+      case 'ArrowDown': case '-': case '_': slower();  break;
+      case ' ':                             reverse(); break;
+      case 'r': case 'R':                  reset();   break;
+    }
+  });
+
+  /* Scroll wheel: up = faster in-direction, down = slower               */
+  canvas.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    if (e.deltaY < 0) faster(); else slower();
+  }, { passive: false });
+
+  /* ───────────────────────── Resize handling ──────────────────────────── */
+
+  function resize() {
+    canvas.width  = window.innerWidth;
+    canvas.height = window.innerHeight;
+    gl.viewport(0, 0, canvas.width, canvas.height);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  /* ──────────────────────────── Render loop ───────────────────────────── */
+
+  function render(ts) {
+    if (prevTs === null) prevTs = ts;
+    const dt = ts - prevTs;
+    prevTs = ts;
+
+    /* Exponential zoom; wrap at boundaries so the animation loops cleanly    */
+    zoom *= Math.exp(zoomRate * dt);
+    if (zoom > ZOOM_MAX) zoom = ZOOM_MIN;
+    if (zoom < ZOOM_MIN) zoom = ZOOM_MAX;
+
+    gl.uniform2f(uRes,    canvas.width, canvas.height);
+    gl.uniform1f(uZoom,   zoom);
+    gl.uniform2f(uCenter, cx, cy);
+    gl.uniform1f(uTime,   ts * 0.001);
+
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+    /* HUD */
+    const exp  = Math.log10(zoom).toFixed(1);
+    const mult = (Math.abs(zoomRate) / BASE_RATE).toFixed(1);
+    const dir  = zoomRate >= 0 ? '\u2192 in' : '\u2190 out';
+    const prec = Math.max(6, Math.ceil(Math.log10(zoom)) + 4); /* more digits as we zoom */
+    let text =
+      'zoom   \u00d710^\u200b' + exp + '\n' +
+      'speed  \u00d7' + mult + '  [' + dir + ']\n' +
+      'target (' + cx.toFixed(prec) + ',\u2009' + cy.toFixed(prec) + 'i)';
+    if (hoverC) {
+      text += '\ncursor (' + hoverC[0].toFixed(prec) + ',\u2009' + hoverC[1].toFixed(prec) + 'i)';
+    }
+    hud.textContent = text;
+
+    requestAnimationFrame(render);
+  }
+
+  requestAnimationFrame(render);
+}());
+</script>
+</body>
+</html>
