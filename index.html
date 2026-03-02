@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>gles</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      height: 100%;
+      background: #000;
+      color: rgba(255,255,255,0.85);
+      font-family: 'Courier New', monospace;
+    }
+    body {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: flex-start;
+      padding: 10vw;
+    }
+    h1 {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: .4em;
+      text-transform: uppercase;
+      color: rgba(255,255,255,0.35);
+      margin-bottom: 3rem;
+    }
+    ul {
+      list-style: none;
+    }
+    li + li {
+      margin-top: 2rem;
+    }
+    a {
+      font-size: 18px;
+      color: #fff;
+      text-decoration: none;
+      letter-spacing: .04em;
+      transition: opacity .15s;
+    }
+    a:hover {
+      opacity: 0.7;
+    }
+    a::before {
+      content: '→ ';
+      color: rgba(255,255,255,0.35);
+    }
+    .desc {
+      display: block;
+      font-size: 12px;
+      color: rgba(255,255,255,0.45);
+      letter-spacing: .05em;
+      margin-top: .5rem;
+      padding-left: 1.4em;
+    }
+  </style>
+</head>
+<body>
+  <h1>gles</h1>
+  <ul>
+    <li>
+      <a href="mandelbrot.html">Mandelbrot Set</a>
+      <span class="desc">WebGL zoom animation · click to target · variable speed</span>
+    </li>
+  </ul>
+</body>
+</html>
