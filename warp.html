@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Warp — WebGL</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+    canvas { display: block; width: 100%; height: 100%; }
+
+    #overlay {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      font-family: 'Courier New', monospace;
+      color: rgba(255, 255, 255, 0.9);
+      text-shadow: 0 1px 6px rgba(0,0,0,0.9), 0 0 2px rgba(0,0,0,1);
+    }
+    #title {
+      position: absolute;
+      top: 22px;
+      width: 100%;
+      text-align: center;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .5em;
+      text-transform: uppercase;
+      color: rgba(255, 255, 255, 0.55);
+    }
+    #hud {
+      position: absolute;
+      bottom: 20px;
+      left: 20px;
+      font-size: 12px;
+      line-height: 2;
+      letter-spacing: .06em;
+    }
+    #controls {
+      position: absolute;
+      bottom: 20px;
+      right: 20px;
+      font-size: 11px;
+      line-height: 2.2;
+      letter-spacing: .06em;
+      text-align: right;
+      color: rgba(255, 255, 255, 0.6);
+    }
+    #controls kbd {
+      display: inline-block;
+      padding: 0 5px;
+      border: 1px solid rgba(255,255,255,0.45);
+      border-radius: 3px;
+      font-family: inherit;
+      font-size: 10px;
+      color: rgba(255,255,255,0.75);
+    }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="overlay">
+  <div id="title">Warp</div>
+  <div id="hud"></div>
+  <div id="controls">
+    <kbd>↑</kbd> / <kbd>↓</kbd> &nbsp;speed<br>
+    <kbd>Space</kbd> &nbsp;pause<br>
+    <kbd>R</kbd> &nbsp;reset
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  const canvas = document.getElementById('c');
+  const hud    = document.getElementById('hud');
+
+  const gl = canvas.getContext('webgl', {
+    alpha: false,
+    antialias: false,
+    preserveDrawingBuffer: false,
+  });
+
+  if (!gl) {
+    document.body.style.cssText =
+      'display:flex;align-items:center;justify-content:center;' +
+      'height:100vh;color:#fff;font-family:monospace;font-size:16px';
+    document.body.textContent = 'WebGL is not supported in this browser.';
+    return;
+  }
+
+  /* ─────────────────────────────── Shaders ─────────────────────────────── */
+
+  const VERT = `
+    attribute vec2 a_pos;
+    void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }
+  `;
+
+  /* Domain-warped Fractional Brownian Motion.
+     Technique by Inigo Quilez — two feedback passes of FBM create
+     the characteristic swirling, turbulent structure.                        */
+  const FRAG = `
+    precision highp float;
+
+    uniform vec2  u_res;
+    uniform float u_time;
+
+    /* Hash without trig — avoids sin() cost on the GPU.                      */
+    float hash(vec2 p) {
+      p = fract(p * vec2(0.1031, 0.1030));
+      p += dot(p, p.yx + 33.33);
+      return fract((p.x + p.y) * p.x);
+    }
+
+    /* Smooth value noise in [-1, 1].                                          */
+    float noise(vec2 p) {
+      vec2 i = floor(p);
+      vec2 f = fract(p);
+      vec2 u = f * f * (3.0 - 2.0 * f);
+      return -1.0 + 2.0 * mix(
+        mix(hash(i),               hash(i + vec2(1.0, 0.0)), u.x),
+        mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), u.x),
+        u.y
+      );
+    }
+
+    /* Rotation + frequency-doubling matrix applied between FBM octaves.
+       det = 1.6²+1.2² = 4  →  scale ×2 per octave, matching amplitude ×0.5. */
+    const mat2 ROT = mat2(1.6, 1.2, -1.2, 1.6);
+
+    float fbm(vec2 p) {
+      float v = 0.0;
+      v += 0.5000 * noise(p); p = ROT * p;
+      v += 0.2500 * noise(p); p = ROT * p;
+      v += 0.1250 * noise(p); p = ROT * p;
+      v += 0.0625 * noise(p);
+      return v / 0.9375;   /* normalise to [-1, 1] */
+    }
+
+    void main() {
+      vec2 uv = (gl_FragCoord.xy * 2.0 - u_res) / min(u_res.x, u_res.y);
+      float t  = u_time;
+
+      /* Pass 1 — q displaces uv using two independent FBM fields.            */
+      vec2 q = vec2(
+        fbm(uv                          + 0.10 * t),
+        fbm(uv + vec2( 5.20,  1.30)     + 0.11 * t)
+      );
+
+      /* Pass 2 — r displaces further, warped by q (non-linear feedback).     */
+      vec2 r = vec2(
+        fbm(uv + 3.5 * q + vec2(1.70, 9.20) + 0.07 * t),
+        fbm(uv + 3.5 * q + vec2(8.30, 2.80) + 0.09 * t)
+      );
+
+      /* Final scalar field, doubly warped.                                    */
+      float f = fbm(uv + 3.0 * r + 0.05 * t);
+
+      /* ── Colour ──────────────────────────────────────────────────────────── */
+
+      /* Base gradient: deep violet → amber, driven by f.                      */
+      float n = clamp(f * 1.4 + 0.55, 0.0, 1.0);
+      vec3 col = mix(
+        vec3(0.06, 0.01, 0.22),   /* deep violet                              */
+        vec3(0.82, 0.38, 0.06),   /* amber                                    */
+        n
+      );
+
+      /* Bright specular highlight where f peaks.                              */
+      col = mix(col, vec3(1.00, 0.95, 0.80), clamp(pow(n, 6.0) * 5.0, 0.0, 1.0));
+
+      /* Cyan tint in strongly-warped regions (length(q) high).               */
+      col = mix(col, vec3(0.05, 0.35, 0.55), clamp(length(q) * 0.55, 0.0, 1.0));
+
+      /* Shimmer from the second warp pass.                                    */
+      col += 0.18 * vec3(0.9, 0.6, 0.2) * clamp(r.x * r.x * 2.5, 0.0, 1.0);
+
+      col = clamp(col, 0.0, 1.0);
+
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `;
+
+  /* ───────────────────────── Compile & link ────────────────────────────── */
+
+  function mkShader(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+      throw new Error('Shader error: ' + gl.getShaderInfoLog(s));
+    return s;
+  }
+
+  const prog = gl.createProgram();
+  gl.attachShader(prog, mkShader(gl.VERTEX_SHADER,   VERT));
+  gl.attachShader(prog, mkShader(gl.FRAGMENT_SHADER, FRAG));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+    throw new Error('Link error: ' + gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+
+  /* ──────────────────────── Fullscreen quad ────────────────────────────── */
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ARRAY_BUFFER,
+    new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+
+  const aPos = gl.getAttribLocation(prog, 'a_pos');
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+  const uRes  = gl.getUniformLocation(prog, 'u_res');
+  const uTime = gl.getUniformLocation(prog, 'u_time');
+
+  /* ─────────────────────── Animation state ─────────────────────────────── */
+
+  const BASE_SPEED = 1.0;
+  const SPEED_MIN  = BASE_SPEED / 8;
+  const SPEED_MAX  = BASE_SPEED * 8;
+
+  let speed   = BASE_SPEED;
+  let paused  = false;
+  let timeAcc = 0.0;
+  let prevTs  = null;
+
+  function faster() { speed = Math.min(speed * 1.6, SPEED_MAX); }
+  function slower() { speed = Math.max(speed / 1.6, SPEED_MIN); }
+  function reset()  { speed = BASE_SPEED; timeAcc = 0.0; }
+
+  document.addEventListener('keydown', function (e) {
+    switch (e.key) {
+      case 'ArrowUp':   case '+': case '=': faster();         break;
+      case 'ArrowDown': case '-': case '_': slower();         break;
+      case ' ':                             paused = !paused; break;
+      case 'r': case 'R':                  reset();           break;
+    }
+  });
+
+  canvas.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    if (e.deltaY < 0) faster(); else slower();
+  }, { passive: false });
+
+  /* ───────────────────────── Resize handling ──────────────────────────── */
+
+  function resize() {
+    canvas.width  = window.innerWidth;
+    canvas.height = window.innerHeight;
+    gl.viewport(0, 0, canvas.width, canvas.height);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  /* ──────────────────────────── Render loop ───────────────────────────── */
+
+  function render(ts) {
+    if (prevTs === null) prevTs = ts;
+    const dt = ts - prevTs;
+    prevTs = ts;
+
+    if (!paused) timeAcc += dt * 0.001 * speed;
+
+    gl.uniform2f(uRes,  canvas.width, canvas.height);
+    gl.uniform1f(uTime, timeAcc);
+
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+    const mult = (speed / BASE_SPEED).toFixed(1);
+    hud.textContent = 'speed  \u00d7' + mult + (paused ? '  [paused]' : '');
+
+    requestAnimationFrame(render);
+  }
+
+  requestAnimationFrame(render);
+}());
+</script>
+</body>
+</html>
